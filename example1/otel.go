@@ -6,117 +6,78 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/stdout/stdoutlog"
 	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
-	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 )
 
-// setupOTelSDK bootstraps the OpenTelemetry pipeline.
-// If it does not return an error, make sure to call shutdown for proper cleanup.
-func setupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
-	var shutdownFuncs []func(context.Context) error
-	var err error
+// setupOTelSDK bootstraps tracing and metrics and returns a shutdown
+// function to flush exporters on exit.
+func setupOTelSDK() (func(), error) {
+	var shutdownFns []func(context.Context) error
 
-	// shutdown calls cleanup functions registered via shutdownFuncs.
-	// The errors from the calls are joined.
-	// Each registered cleanup will be invoked once.
-	shutdown := func(ctx context.Context) error {
+	shutdown := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		var err error
-		for _, fn := range shutdownFuncs {
+		for _, fn := range shutdownFns {
 			err = errors.Join(err, fn(ctx))
 		}
-		shutdownFuncs = nil
-		return err
+		if err != nil {
+			// you could log this if desired
+		}
 	}
 
-	// handleErr calls shutdown for cleanup and makes sure that all errors are returned.
-	handleErr := func(inErr error) {
-		err = errors.Join(inErr, shutdown(ctx))
-	}
-
-	// Set up propagator.
-	prop := newPropagator()
-	otel.SetTextMapPropagator(prop)
-
-	// Set up trace provider.
-	tracerProvider, err := newTracerProvider()
-	if err != nil {
-		handleErr(err)
-		return shutdown, err
-	}
-	shutdownFuncs = append(shutdownFuncs, tracerProvider.Shutdown)
-	otel.SetTracerProvider(tracerProvider)
-
-	// Set up meter provider.
-	meterProvider, err := newMeterProvider()
-	if err != nil {
-		handleErr(err)
-		return shutdown, err
-	}
-	shutdownFuncs = append(shutdownFuncs, meterProvider.Shutdown)
-	otel.SetMeterProvider(meterProvider)
-
-	// Set up logger provider.
-	loggerProvider, err := newLoggerProvider()
-	if err != nil {
-		handleErr(err)
-		return shutdown, err
-	}
-	shutdownFuncs = append(shutdownFuncs, loggerProvider.Shutdown)
-	global.SetLoggerProvider(loggerProvider)
-
-	return shutdown, err
-}
-
-func newPropagator() propagation.TextMapPropagator {
-	return propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
+	// Identify this service so exporters show a proper name/version.
+	res, err := resource.New(
+		context.Background(),
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String("dice-service"),
+			semconv.ServiceVersionKey.String("0.1.0"),
+		),
 	)
-}
-
-func newTracerProvider() (*trace.TracerProvider, error) {
-	traceExporter, err := stdouttrace.New(
-		stdouttrace.WithPrettyPrint())
 	if err != nil {
-		return nil, err
+		return shutdown, err
 	}
 
-	tracerProvider := trace.NewTracerProvider(
-		trace.WithBatcher(traceExporter,
-			// Default is 5s. Set to 1s for demonstrative purposes.
-			trace.WithBatchTimeout(time.Second)),
+	// Set context propagator for distributed tracing.
+	otel.SetTextMapPropagator(
+		propagation.NewCompositeTextMapPropagator(
+			propagation.TraceContext{},
+			propagation.Baggage{},
+		),
 	)
-	return tracerProvider, nil
-}
 
-func newMeterProvider() (*metric.MeterProvider, error) {
+	// ----- Tracing -----
+	traceExporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
+	if err != nil {
+		return shutdown, err
+	}
+	tp := trace.NewTracerProvider(
+		trace.WithResource(res),
+		trace.WithBatcher(traceExporter, trace.WithBatchTimeout(time.Second)),
+	)
+	otel.SetTracerProvider(tp)
+	shutdownFns = append(shutdownFns, tp.Shutdown)
+
+	// ----- Metrics -----
 	metricExporter, err := stdoutmetric.New()
 	if err != nil {
-		return nil, err
+		return shutdown, err
 	}
-
-	meterProvider := metric.NewMeterProvider(
-		metric.WithReader(metric.NewPeriodicReader(metricExporter,
-			// Default is 1m. Set to 3s for demonstrative purposes.
-			metric.WithInterval(3*time.Second))),
+	mp := metric.NewMeterProvider(
+		metric.WithResource(res),
+		metric.WithReader(metric.NewPeriodicReader(
+			metricExporter,
+			metric.WithInterval(3*time.Second),
+		)),
 	)
-	return meterProvider, nil
-}
+	otel.SetMeterProvider(mp)
+	shutdownFns = append(shutdownFns, mp.Shutdown)
 
-func newLoggerProvider() (*log.LoggerProvider, error) {
-	logExporter, err := stdoutlog.New()
-	if err != nil {
-		return nil, err
-	}
-
-	loggerProvider := log.NewLoggerProvider(
-		log.WithProcessor(log.NewBatchProcessor(logExporter)),
-	)
-	return loggerProvider, nil
+	return shutdown, nil
 }
