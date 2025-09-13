@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -28,7 +29,7 @@ func setupOTelSDK() (func(), error) {
 			err = errors.Join(err, fn(ctx))
 		}
 		if err != nil {
-			// you could log this if desired
+			log.Printf("OpenTelemetry shutdown encountered errors: %v", err)
 		}
 	}
 

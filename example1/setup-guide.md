@@ -14,5 +14,3 @@ go get `
 "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp" `
 "go.opentelemetry.io/contrib/bridges/otelslog"
 ```
-
-2. 
